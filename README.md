@@ -69,3 +69,11 @@ For the dataset, it can be downloaded and processed using the script `https://gi
 DSBM-IPF: `python main.py dataset=downscaler_transfer num_steps=30 num_iter=5000 gamma_min=0.01 gamma_max=0.01 model=DownscalerUNET`
 
 DSBM-IMF: `python main.py dataset=downscaler_transfer num_steps=30 num_iter=5000 gamma_min=0.01 gamma_max=0.01 model=DownscalerUNET first_coupling=ind`
+
+
+
+Instruction for using with NeuralOde:
+1. Create trajectories from DSBM: python DSBM-Gaussian.py dim=5 model_name=dsbm seed=1 inner_iters=10000 outer_iters=10 (maybe QT_QPA_PLATFORM=offscreen python DSBM-Gaussian.py dim=5 model_name=dsbm seed=1 inner_iters=10000 )
+2. Move "traj.npy" to main path
+3. Start experiments with NeuralOde: python DSBM-Gaussian.py dim=5 model_name=dsbm_neuralode seed=1 inner_iters=10000 outer_iters=10 
+
