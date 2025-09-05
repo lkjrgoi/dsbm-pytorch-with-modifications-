@@ -1,3 +1,8 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Отключает предупреждения TensorFlow
+import warnings
+warnings.filterwarnings('ignore')
+
 import torch
 import numpy as np
 import pandas as pd
@@ -10,14 +15,21 @@ from tqdm import tqdm
 from functools import partial
 import copy
 import ot as pot
+try:
+    import torchdiffeq
+    TORCHDIFFEQ_AVAILABLE = True
+except ImportError:
+    TORCHDIFFEQ_AVAILABLE = False
+    print("Warning: torchdiffeq not available. Neural ODE functionality will be limited.")
 
 from typing import List, Optional, Tuple
 import hydra
 import pytorch_lightning as pl
 from omegaconf import DictConfig
+import math
 
-
-device = 'cuda'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
 dataset_size = 10000 #Размер обучающего набора
 test_dataset_size = 10000# Размер тестового набора
 lr = 1e-4
@@ -345,107 +357,180 @@ def train_dsbm(dsbm_ipf, x_pairs, batch_size, inner_iters, prev_model=None, fb='
   return dsbm_ipf, loss_curve
 
 class ODEFunc(nn.Module):
-    """Новый класс для NeuralODE, заменяющий ScoreNetwork"""
+    """Neural ODE функция с поддержкой батчового времени для моста Шредингера"""
     def __init__(self, input_dim, hidden_dims=[128, 128]):
         super().__init__()
         layers = []
-        prev_dim = input_dim
+        prev_dim = input_dim + 1  # +1 для времени
         for h_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, h_dim))
             layers.append(nn.Tanh())
             prev_dim = h_dim
         layers.append(nn.Linear(prev_dim, input_dim))
         self.net = nn.Sequential(*layers)
+        self.input_dim = input_dim
     
     def forward(self, t, x):
-        return self.net(x)
+        """
+        определяет правую часть нашего дифференциального уравнения: dx/dt = f(t, x)
+        t: scalar или tensor [batch_size] (время для каждой точки)
+        x: tensor [batch_size, input_dim] (состояния)
+        """
+        # Проверка входной размерности
+        if x.shape[1] != self.input_dim:
+            raise ValueError(f"Input dimension mismatch: expected {self.input_dim}, got {x.shape[1]}")
+        
+        # Обработка времени
+        if isinstance(t, torch.Tensor) and t.dim() == 1:
+            # Батч времени: t shape [batch_size] -> [batch_size, 1]
+            t_vector = t.unsqueeze(1)
+        elif isinstance(t, torch.Tensor) and t.dim() == 0:
+            # Скалярное время в тензоре
+            t_vector = t.item() * torch.ones(x.shape[0], 1, device=x.device, dtype=x.dtype)
+        else:
+            # Скалярное время (float)
+            t_vector = t * torch.ones(x.shape[0], 1, device=x.device, dtype=x.dtype)
+        # Время t конкатенируется с состоянием x, чтобы сеть могла обучаться зависимости производной от времени
+        # Конкатенация: [batch_size, input_dim] + [batch_size, 1] = [batch_size, input_dim+1]
+        inputs = torch.cat([x, t_vector], dim=1)
+        
+        return self.net(inputs)
 
 
 class DSBM_NeuralODE(nn.Module):
-    def __init__(self, input_dim, num_steps=1000, sig=0, eps=1e-3, first_coupling="ref", traj_file='/home/user1/dsbm-pytorch/traj.npy', pretrain_epochs=1000):
+    def __init__(self, input_dim, num_steps=1000, sig=0, eps=1e-3, first_coupling="ref", traj_file=None, pretrain_epochs=100):
         super().__init__()
-        self.net = ODEFunc(input_dim).to(device)  # Используем новый класс ODEFunc
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.net_forward = ODEFunc(input_dim).to(device)  # Используем ODEFunc для прямой сети и обратной 
+        self.net_backward = ODEFunc(input_dim).to(device)
+        self.optimizer_forward = torch.optim.Adam(self.net_forward.parameters(), lr=lr)
+        self.optimizer_backward = torch.optim.Adam(self.net_backward.parameters(), lr=lr)
         self.N = num_steps
         self.sig = sig
         self.eps = eps
         self.first_coupling = first_coupling
         self.traj_file = traj_file
-        self.trained = False
+        self.input_dim = input_dim
+        self.trained_forward = False
+        self.trained_backward = False
         self.fb = None
         self.pretrain_epochs = pretrain_epochs
-        self._load_and_preprocess_trajectories()
-    
+
+        if traj_file:
+          self._load_and_preprocess_trajectories()
+        else:
+            self.traj_tensor = None
+            self.dataset = None
+            self.dataloader = None
+
     def _load_and_preprocess_trajectories(self):
         """Загрузка и подготовка данных траекторий"""
-        traj_data = np.load(self.traj_file)
-        print(f"Loaded trajectory data with shape: {traj_data.shape}")
+        try:
+          traj_data = np.load(self.traj_file)
+          print(f"Loaded trajectory data with shape: {traj_data.shape}")
         
-        self.traj_tensor = torch.tensor(traj_data, dtype=torch.float32, device=device)
+          self.traj_tensor = torch.tensor(traj_data, dtype=torch.float32, device=device)
         
-        # Подготовка пар (z_t, z_{t+1}) для обучения
-        self.X = self.traj_tensor[:, :-1, :].reshape(-1, self.traj_tensor.shape[-1])
-        self.y = self.traj_tensor[:, 1:, :].reshape(-1, self.traj_tensor.shape[-1])
+          # Подготовка пар (z_t, z_{t+1}) траекторий для обучения
+          self.X = self.traj_tensor[:, :-1, :].reshape(-1, self.traj_tensor.shape[-1])
+          self.y = self.traj_tensor[:, 1:, :].reshape(-1, self.traj_tensor.shape[-1])
         
-        self.dataset = TensorDataset(self.X, self.y)
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
-    
-    def train_on_trajectories(self, epochs=1000):
+          self.dataset = TensorDataset(self.X, self.y)
+          self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True, 
+                                   pin_memory=False)
+        except FileNotFoundError:
+            print(f"Trajectory file {self.traj_file} not found, skipping pretraining")
+            self.traj_tensor = None
+            self.dataset = None
+            self.dataloader = None
+
+    def train_on_trajectories(self, direction='both',epochs=None):
         """Обучение NeuralODE на загруженных траекториях"""
-        if self.trained:
+        if self.traj_tensor is None or self.dataloader is None:
+            print("No trajectory data available for pretraining")
             return
+        
         if epochs is None:
             epochs = self.pretrain_epochs  # Используем pretrain_epochs, если явно не указано
 
         criterion = nn.MSELoss()
         
         for epoch in range(epochs):
-            epoch_loss = 0
+            epoch_loss_forward = 0
+            epoch_loss_backward = 0
+            batch_count = 0
+
             for batch_X, batch_y in self.dataloader:
-                self.optimizer.zero_grad()
+                batch_count += 1
+                # Обучение forward сети
+                if direction in ['both', 'forward']:
+                    self.optimizer_forward.zero_grad()
+                    t = torch.rand(1, device=device).item()# Скаляр времени, для каждого батча используем случайное время (выбирается случайным образом)
+                    pred_dx = self.net_forward(t, batch_X)# Предсказание производной
+                    pred_y = batch_X + pred_dx * (1.0/self.N)  # шаг Эйлера
+                    loss_forward = criterion(pred_y, batch_y)
+                    loss_forward.backward()
+                    self.optimizer_forward.step()
+                    epoch_loss_forward += loss_forward.item()
                 
-                # Предсказываем следующую точку
-                pred_y = batch_X + self.net(0, batch_X) * (1.0/self.N)
-                
-                loss = criterion(pred_y, batch_y)
-                loss.backward()
-                self.optimizer.step()
-                epoch_loss += loss.item()
+                # Обучение backward сети  
+                if direction in ['both', 'backward']:
+                    self.optimizer_backward.zero_grad()
+                    t = torch.rand(1, device=device).item()  # Скаляр времени
+                    pred_dx = self.net_backward(t, batch_y)  # Предсказание производной
+                    pred_x = batch_y + pred_dx * (1.0/self.N)  # шаг Эйлера
+                    loss_backward = criterion(pred_x, batch_X)
+                    loss_backward.backward()
+                    self.optimizer_backward.step()
+                    epoch_loss_backward += loss_backward.item()
             
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}, Loss: {epoch_loss/len(self.dataloader)}")
-        
-        self.trained = True
+            # Вычисление среднего лосса
+            if batch_count > 0:
+                if direction in ['both', 'forward']:
+                    avg_loss_forward = epoch_loss_forward / batch_count
+                    print(f"Pretrain Epoch {epoch}, Forward Loss: {avg_loss_forward:.6f}")
+            
+                if direction in ['both', 'backward']:
+                    avg_loss_backward = epoch_loss_backward / batch_count
+                    print(f"Pretrain Epoch {epoch}, Backward Loss: {avg_loss_backward:.6f}")
+    
+        print(f"Pretraining completed for {direction} direction")
+    
+    def get_network(self, direction):
+        """Возвращает соответствующую сеть для направления"""
+        if direction == 'f':
+            return self.net_forward
+        elif direction == 'b':
+            return self.net_backward
+        else:
+            raise ValueError(f"Unknown direction: {direction}")
+    
+    def get_optimizer(self, direction):
+        """Возвращает соответствующий оптимизатор"""
+        if direction == 'f':
+            return self.optimizer_forward
+        elif direction == 'b':
+            return self.optimizer_backward
+        else:
+            raise ValueError(f"Unknown direction: {direction}")
     
     @torch.no_grad()
     def get_train_tuple(self, x_pairs=None, fb='', **kwargs):
         """Генерация обучающих данных"""
-        if not self.trained:
-            self.train_on_trajectories()
+        z0, z1 = x_pairs[:, 0], x_pairs[:, 1]
         
-        idx = torch.randint(0, len(self.dataset), (1,)).item()
-        z_t = self.dataset[idx][0].unsqueeze(0)
-        t = torch.rand((1, 1), device=device) * (1-2*self.eps) + self.eps
-        target = self.dataset[idx][1].unsqueeze(0) - z_t
+        t = torch.rand((z1.shape[0], 1), device=device) * (1-2*self.eps) + self.eps
+        z_t = t * z1 + (1.-t) * z0
+        z = torch.randn_like(z_t)
+        z_t = z_t + self.sig * torch.sqrt(t*(1.-t)) * z
+        
+        # Для Neural ODE цель - производная (скорость изменения)
+        if fb == 'f':
+            target = z1 - z0 - self.sig * torch.sqrt(t/(1.-t)) * z
+        else:
+            target = -(z1 - z0) - self.sig * torch.sqrt((1.-t)/t) * z
         
         return z_t, t, target
 
-    @torch.no_grad()
-    def sample_ode(self, zstart=None, N=None, fb='', first_it=False):
-        """Семплирование траектории"""
-        if N is None:
-            N = self.N
-        
-        traj = [zstart.detach().clone()]
-        z = zstart.detach().clone()
-        dt = 1.0 / N
-        sign = 1 if fb == 'f' else -1
-        
-        for _ in range(N):
-            z = z + sign * self.net(0, z) * dt
-            traj.append(z.detach().clone())
-        
-        return traj
     @torch.no_grad()
     def generate_new_dataset(self, x_pairs, prev_model=None, fb='', first_it=False):
         """Генерация новых пар (z0, z1) для обучения"""
@@ -454,14 +539,12 @@ class DSBM_NeuralODE(nn.Module):
         if prev_model is None:
             assert first_it
             assert fb == 'b'
-            # Первая итерация
             zstart = x_pairs[:, 0]
             if self.first_coupling == "ref":
-                # First coupling is x_0, x_0 perturbed
                 zend = zstart + torch.randn_like(zstart) * self.sig
             elif self.first_coupling == "ind":
                 zend = x_pairs[:, 1].clone()
-                zend = zend[torch.randperm(len(zend))]  # перестановка для независимого сопряжения
+                zend = zend[torch.randperm(len(zend))]
             else:
                 raise NotImplementedError
             z0, z1 = zstart, zend
@@ -471,45 +554,160 @@ class DSBM_NeuralODE(nn.Module):
                 zstart = x_pairs[:, 0]
             else:
                 zstart = x_pairs[:, 1]
-            # Последующие итерации - используем предыдущую модель для генерации
-            zend = prev_model.sample_ode(zstart=zstart, fb=prev_model.fb)[-1]
+            
+            # Используем sample_sde для генерации конечных точек
+            zend = prev_model.sample_sde(zstart=zstart, fb=prev_model.fb)[-1]
+            
             if prev_model.fb == 'f':
                 z0, z1 = zstart, zend
             else:
                 z0, z1 = zend, zstart
+        
         return z0, z1
+    
+    @torch.no_grad()
+    def sample_sde(self, zstart=None, N=None, fb='', first_it=False):
+        """Семплирование SDE версии (Эйлер-Маруяма)"""
+        assert fb in ['f', 'b']
+        
+        if N is None:
+            N = self.N
+        
+        traj = [zstart.detach().clone()]
+        z = zstart.detach().clone()
+        dt = 1.0 / N
+        
+        net = self.get_network(fb)
+        
+        if fb == 'f':
+            time_points = torch.linspace(0, 1, N, device=device)
+        else:
+            time_points = torch.linspace(1, 0, N, device=device)
+        
+        for i in range(N):
+            t = time_points[i].item()  # Скаляр времени
+            # Детерминированный шаг
+            dz_det = net(t, z) * dt
+            # Стохастический шаг
+            
+            dz_stoch = self.sig * torch.randn_like(z) * math.sqrt(dt)
+            
+            z = z + dz_det + dz_stoch
+            traj.append(z.detach().clone())
+        
+        return traj
+    
+    @torch.no_grad()
+    def sample_ode(self, zstart=None, N=None, fb=''):
+        """Семплирование ODE версии (если доступен torchdiffeq)"""
+        assert fb in ['f', 'b']
+        
+        if not TORCHDIFFEQ_AVAILABLE:
+            print("Warning: torchdiffeq not available, using Euler method")
+            return self.sample_sde(zstart, N, fb)
+        
+        if N is None:
+            N = self.N
+        
+        net = self.get_network(fb)
+        
+        if fb == 'f':
+            t_span = torch.linspace(0, 1, N, device=device)
+        else:
+            t_span = torch.linspace(1, 0, N, device=device)
+        
+        # Решаем ODE
+        traj = torchdiffeq.odeint(net, zstart, t_span, method='euler')
+        
+        return traj
 
 def train_dsbm_neuralode(dsbm_model, x_pairs, batch_size, inner_iters, prev_model=None, fb='', first_it=False):
-    """Функция обучения DSBM с NeuralODE"""
-    if first_it and not dsbm_model.trained:
-        print("Initial training on saved trajectories...")
-        dsbm_model.train_on_trajectories(epochs=None)
-        return dsbm_model, []
-    
+    """Функция обучения DSBM с NeuralODE для задачи Шредингера"""
+    assert fb in ['f', 'b']
     dsbm_model.fb = fb
-    optimizer = dsbm_model.optimizer
+    optimizer = dsbm_model.get_optimizer(fb)
     loss_curve = []
     
-    dl = iter(DataLoader(TensorDataset(*dsbm_model.generate_new_dataset(x_pairs, prev_model, fb, first_it)), 
-                     batch_size=batch_size, shuffle=True))
+    # Претренинг если нужно (только на первой итерации)
+    if first_it and not (dsbm_model.trained_forward if fb == 'f' else dsbm_model.trained_backward):
+        print(f"Initial training on saved trajectories for {fb} direction...")
+        dsbm_model.train_on_trajectories(direction='forward' if fb == 'f' else 'backward', 
+                                       epochs=min(50, dsbm_model.pretrain_epochs))
     
-    for i in tqdm(range(inner_iters)):
-        try:
-            z0, z1 = next(dl)
-        except StopIteration:
-            dl = iter(DataLoader(TensorDataset(*dsbm_model.generate_new_dataset(x_pairs, prev_model, fb, first_it)), 
-                         batch_size=batch_size, shuffle=True))
-            z0, z1 = next(dl)
+    # Генерация нового датасета в соответствии с процедурой IPF
+    z0, z1 = dsbm_model.generate_new_dataset(x_pairs, prev_model, fb, first_it)
+    z_pairs = torch.stack([z0, z1], dim=1)
+    
+    # Создание обучающих данных (аналогично DSBM)
+    z_t, t, target = dsbm_model.get_train_tuple(z_pairs, fb=fb)
+    
+    # Проверка размерностей
+    print(f"Training data shapes - z_t: {z_t.shape}, t: {t.shape}, target: {target.shape}")
+    print(f"Network expects input dimension: {dsbm_model.net_forward.input_dim}")
+    
+    dataset = TensorDataset(z_t, t, target)
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True, pin_memory=False)
+    
+    early_stop = False
+    
+    for i in tqdm(range(inner_iters), desc=f"Training {fb} direction"):
+        if early_stop:
+            break
+            
+        epoch_loss = 0
+        num_batches = 0
         
-        z_pairs = torch.stack([z0, z1], dim=1)
-        z_t, t, target = dsbm_model.get_train_tuple(z_pairs, fb=fb)
+        for z_t_batch, t_batch, target_batch in dl:
+            optimizer.zero_grad()
+            net = dsbm_model.get_network(fb)
+            
+            # КОРРЕКТНО: передаем время для КАЖДОЙ точки индивидуально
+            # t_batch: [batch_size, 1] -> [batch_size]
+            t_batch = t_batch.squeeze(1)
+            
+            # Важная проверка размерностей
+            if z_t_batch.shape[1] != dsbm_model.input_dim:
+                raise ValueError(f"Batch dimension mismatch: expected {dsbm_model.input_dim}, got {z_t_batch.shape[1]}")
+            
+            # Каждая точка обучается при СВОЕМ времени - это важно для Шредингера!
+            pred = net(t_batch, z_t_batch)
+            
+            # MSE loss между предсказанной и целевой производной
+            loss = F.mse_loss(pred, target_batch)
+            loss.backward()
+            
+            # Градиентный clipping для стабильности
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+            loss_curve.append(loss.item())
+            
+            if torch.isnan(loss).any():
+                print("NaN loss detected, stopping training")
+                early_stop = True
+                break
         
-        optimizer.zero_grad()
-        pred = dsbm_model.net(0, z_t)  # Время не используется в нашей NeuralODE
-        loss = F.mse_loss(pred, target)
-        loss.backward()
-        optimizer.step()
-        loss_curve.append(loss.item())
+        # Логирование прогресса
+        if num_batches > 0 and i % 10 == 0:
+            avg_loss = epoch_loss / num_batches
+            print(f"Iteration {i}, Average Loss: {avg_loss:.6f}")
+            
+            # Ранняя остановка если loss не улучшается
+            if i > 100 and avg_loss > 10.0:  # Эвристика для обнаружения расходимости
+                print("Loss too high, stopping training")
+                early_stop = True
+                break
+    
+    # Обновляем флаги обучения после завершения
+    if fb == 'f':
+        dsbm_model.trained_forward = True
+        print("Forward network training completed")
+    else:
+        dsbm_model.trained_backward = True
+        print("Backward network training completed")
     
     return dsbm_model, loss_curve
 
@@ -750,8 +948,9 @@ def train(cfg: DictConfig):#Основной тренировочный цикл
                           sig=sigma,
                           first_coupling=cfg.first_coupling,
                           traj_file='/home/user1/dsbm-pytorch/traj.npy',
-                          pretrain_epochs=1000)
+                          pretrain_epochs=100)
     train_fn = train_dsbm_neuralode
+    print("Using DSBM with Neural ODE")
   
   elif cfg.model_name == "sbcfm":
     model = SBCFM(net=net_fn().to(device), 
@@ -793,11 +992,19 @@ def train(cfg: DictConfig):#Основной тренировочный цикл
         # Evaluation
         optimal_result_dict = {'mean': -a, 'var': 1, 'cov': (np.sqrt(5) - 1) / 2}
         result_list = {k: [] for k in optimal_result_dict.keys()}
-        for i in range(it):
-          traj = model_list[i]['model'].sample_sde(zstart=x1_test, fb='b')
-          result_list['mean'].append(traj[-1].mean(0).mean(0).item())
-          result_list['var'].append(traj[-1].var(0).mean(0).item())
-          result_list['cov'].append(torch.cov(torch.cat([traj[0], traj[-1]], dim=1).T)[dim:, :dim].diag().mean(0).item())
+        for i in range(len(model_list)):
+          try:
+            traj = model_list[i]['model'].sample_sde(zstart=x1_test, fb='b')
+            result_list['mean'].append(traj[-1].mean(0).mean(0).item())
+            result_list['var'].append(traj[-1].var(0).mean(0).item())
+            result_list['cov'].append(torch.cov(torch.cat([traj[0], traj[-1]], dim=1).T)[dim:, :dim].diag().mean(0).item())
+          except Exception as e:
+            print(f"Error processing model {i}: {e}")
+            # Добавляем NaN для сохранения одинаковой длины
+            result_list['mean'].append(float('nan'))
+            result_list['var'].append(float('nan'))
+            result_list['cov'].append(float('nan'))    
+                
         for i, k in enumerate(result_list.keys()):
           plt.plot(result_list[k], label=f"{cfg.model_name}-{cfg.net_name}")
           plt.plot(np.arange(outer_iters), optimal_result_dict[k] * np.ones(outer_iters), label="optimal", linestyle="--")
@@ -813,9 +1020,9 @@ def train(cfg: DictConfig):#Основной тренировочный цикл
           result_list_100['mean'].append(traj_100[-1].mean(0).mean(0).item())
           result_list_100['var'].append(traj_100[-1].var(0).mean(0).item())
           result_list_100['cov'].append(torch.cov(torch.cat([traj_100[0], traj_100[-1]], dim=1).T)[dim:, :dim].diag().mean(0).item())
-      
+          
       if hasattr(model, "sample_ode"):
-        draw_plot(partial(model.sample_ode, zstart=x_test_dict[fb], fb=fb, first_it=first_it), z0=x_test_dict['f'], z1=x_test_dict['b'])
+        draw_plot(partial(model.sample_ode, zstart=x_test_dict[fb], fb=fb), z0=x_test_dict['f'], z1=x_test_dict['b'])
         plt.savefig(f"{it}-{fb}-ode.png")
         plt.close()
 
@@ -837,11 +1044,18 @@ def train(cfg: DictConfig):#Основной тренировочный цикл
           plt.close()
         
         result_list_ode_100 = {k: [] for k in optimal_result_dict_ode.keys()}
-        for i in range(it):
-          traj_ode_100 = model_list[i]['model'].sample_ode(zstart=x1_test, fb='b', N=100)
-          result_list_ode_100['mean'].append(traj_ode_100[-1].mean(0).mean(0).item())
-          result_list_ode_100['var'].append(traj_ode_100[-1].var(0).mean(0).item())
-          result_list_ode_100['cov'].append(torch.cov(torch.cat([traj_ode_100[0], traj[-1]], dim=1).T)[dim:, :dim].diag().mean(0).item())#
+        for i in range(len(model_list)):
+          try:
+            traj_ode_100 = model_list[i]['model'].sample_ode(zstart=x1_test, fb='b', N=100)
+            result_list_ode_100['mean'].append(traj_ode_100[-1].mean(0).mean(0).item())
+            result_list_ode_100['var'].append(traj_ode_100[-1].var(0).mean(0).item())
+            result_list_ode_100['cov'].append(torch.cov(torch.cat([traj_ode_100[0], traj[-1]], dim=1).T)[dim:, :dim].diag().mean(0).item())#
+          except Exception as e:
+            print(f"Error processing model {i}: {e}")
+            # Добавляем NaN для сохранения одинаковой длины
+            result_list['mean'].append(float('nan'))
+            result_list['var'].append(float('nan'))
+            result_list['cov'].append(float('nan'))
       # first_it = False
       it += 1
 
@@ -881,7 +1095,6 @@ def train(cfg: DictConfig):#Основной тренировочный цикл
 def main(cfg: DictConfig) -> Optional[float]:
     # train the model
     train(cfg)
-
 
 if __name__ == "__main__":
     main()
